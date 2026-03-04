@@ -34,7 +34,7 @@ The repository is organized to support Phase I now and additional phases later:
 
 - Recommended: **Python 3.10+**
 
-### Required Packages
+### Required Packages and Libraries for Phase 1
 
 The Phase I notebook currently imports the following libraries:
 
