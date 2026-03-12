@@ -77,7 +77,7 @@ Phase I of the project focuses on:
 
 This baseline establishes a reference point for the manual and Bayesian models that will be implemented in later phases.
 
-## Repository structure
+## Repo structure
 
 ```text
 credit-default-ml-project/
