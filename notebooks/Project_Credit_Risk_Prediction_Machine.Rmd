@@ -1,0 +1,347 @@
+---
+title: "DS4420 Credit Risk Prediction — Bayesian Logistic Regression"
+output: pdf_document
+date: "2026-04-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Core libraries for Bayesian modeling and data manipulation
+library(rstan)       # Stan interface for R — runs our Bayesian logistic regression
+library(loo)         # Leave-one-out cross-validation (LOO-CV) for model comparison
+library(tidyverse)   # Data wrangling and visualization utilities
+
+# Performance settings
+# Use all available CPU cores for parallel MCMC chain sampling
+options(mc.cores = parallel::detectCores())
+
+# Save compiled Stan models to disk so we don't recompile every run
+rstan_options(auto_write = TRUE)
+
+# Set random seed for reproducibility across all sampling steps
+set.seed(42)
+```
+
+## ------------------------------------------------------------
+
+## Data Loading
+
+We're working with the Taiwan credit card default dataset,pre-split into train and test sets (80/20 split done earlier in the Python pipeline).
+
+```{r}
+train <- read.csv("taiwan_train.csv")
+test  <- read.csv("taiwan_test.csv")
+
+# Pull out feature names — everything except the target column "default"
+feature_cols <- setdiff(names(train), "default")
+
+# Convert to matrix format (required by Stan) and integer for binary outcome
+X_train <- as.matrix(train[, feature_cols])
+y_train <- as.integer(train$default)
+X_test  <- as.matrix(test[, feature_cols])
+y_test  <- as.integer(test$default)
+
+# Store dimensions — these get passed into the Stan model as data
+N_train <- nrow(X_train)   # number of training observations
+N_test  <- nrow(X_test)    # number of test observations
+P       <- ncol(X_train)   # number of features (predictors)
+
+# Quick sanity check — print split sizes, default rates, and feature list
+cat("Train:", N_train, "| Test:", N_test, "| Features:", P, "\n")
+cat("Train default rate:", mean(y_train), "\n")
+cat("Test default rate: ", mean(y_test),  "\n")
+cat("Features:", feature_cols, "\n")
+```
+
+## -----------------------------------------------------
+
+## Stan Model: Bayesian Logistic Regression
+
+We define the model as a string and compile it once. Both the primary (Normal(0, 2.5)) and sensitivity (Normal(0, 1.0)) runs share this same compiled object — only the prior_scale changes.
+
+### Model structure:
+
+-   Likelihood: y \~ Bernoulli(logit\^-1(alpha + X \* beta))
+-   Prior alpha: Normal(0, 10) — weakly informative intercept
+-   Prior beta: Normal(0, prior_scale) — controllable via prior_scale
+
+Generated quantities section computes three things:
+
+1.  p_test — posterior predictive probabilities on the test set
+2.  y_test_pred — binary draws from those probabilities
+3.  log_lik — per-observation log-likelihood for LOO-CV
+
+```{r}
+stan_model_code <- "
+data {
+  int<lower=0> N_train;   // number of training observations
+  int<lower=0> N_test;    // number of test observations
+  int<lower=1> P;    // number of features
+  matrix[N_train, P] X_train;   // training feature matrix
+  array[N_train] int<lower=0,upper=1> y_train;    // binary training labels (0 = no default, 1 = default)
+  matrix[N_test, P]  X_test;    // test feature matrix
+  real<lower=0> prior_scale;   // std dev for beta prior (2.5 = primary, 1.0 = sensitivity)
+}
+
+parameters {
+  real alpha;          // intercept
+  vector[P] beta;      // coefficient vector (one per feature)
+}
+
+model {
+  // Priors
+  alpha ~ normal(0, 10);               // weakly informative — lets the data speak
+  beta  ~ normal(0, prior_scale);     // tighter prior in sensitivity run shrinks coefficients
+
+  // Likelihood
+  y_train ~ bernoulli_logit(alpha + X_train * beta);
+}
+
+generated quantities {
+  vector[N_test] p_test;    // predicted default probability for each test obs
+  array[N_test] int y_test_pred;    // sampled binary prediction (0 or 1)
+  vector[N_train] log_lik;    // log-likelihood per training obs (used for LOO-CV)
+
+  // Posterior predictive probabilities and binary draws on test set
+  for (n in 1:N_test) {
+    p_test[n]      = inv_logit(alpha + dot_product(X_test[n], beta));
+    y_test_pred[n] = bernoulli_rng(p_test[n]);
+  }
+
+  // Per-observation log-likelihood on training set (needed for loo())
+  for (n in 1:N_train) {
+    log_lik[n] = bernoulli_logit_lpmf(y_train[n] | alpha + dot_product(X_train[n], beta));
+  }
+}
+"
+
+# Compile the Stan model once up front — this avoids recompiling for each prior run.
+# The compiled object is reused in both sampling calls below.
+stan_model_compiled <- stan_model(model_code = stan_model_code)
+```
+
+## -----------------------------------------------------
+
+## Helper: Build Stan Data List
+
+Stan requires all inputs to be passed as a named list. We wrap this in a function so we can easily swap the prior_scale between the two model runs without repeating code.
+
+-   prior_scale = 2.5 -\> primary model (wider, more permissive prior)
+-   prior_scale = 1.0 -\> sensitivity model (tighter prior, more shrinkage)
+
+```{r}
+make_stan_data <- function(prior_scale) {
+  list(
+    N_train     = N_train,
+    N_test      = N_test,
+    P           = P,
+    X_train     = X_train,
+    y_train     = y_train,
+    X_test      = X_test,
+    prior_scale = prior_scale
+  )
+}
+```
+
+## -----------------------------------------------------
+
+## MCMC Sampling — Two Prior Specifications
+
+We run the same model structure twice, varying only the prior on beta to assess sensitivity to that choice.
+
+### Sampling settings (same for both runs):
+
+-   4 chains run in parallel
+-   2000 iterations total: 1000 warmup + 1000 sampling per chain
+-   4 chains x 1000 draws = 4000 posterior draws total
+-   refresh = 200 prints a progress update every 200 iterations
+
+```{r}
+# --- Run 1: Primary model — Normal(0, 2.5) prior on beta ---
+cat("\n── Sampling: primary prior Normal(0, 2.5) ──\n")
+fit_primary <- sampling(
+  stan_model_compiled,
+  data    = make_stan_data(2.5),
+  chains  = 4,
+  iter    = 2000,   # 1000 warmup + 1000 sampling per chain
+  warmup  = 1000,
+  seed    = 42,
+  refresh = 200
+)
+
+# --- Run 2: Sensitivity model — Normal(0, 1.0) prior on beta ---
+# A tighter prior shrinks coefficients toward zero more aggressively.
+# If results are stable across both runs, we have stronger confidence
+# in our conclusions.
+cat("\n── Sampling: sensitivity prior Normal(0, 1.0) ──\n")
+fit_sensitivity <- sampling(
+  stan_model_compiled,
+  data    = make_stan_data(1.0),
+  chains  = 4,
+  iter    = 2000,
+  warmup  = 1000,
+  seed    = 42,
+  refresh = 200
+)
+```
+
+## -----------------------------------------------------
+
+## MCMC Convergence Diagnostics
+
+1.  Rhat (potential scale reduction factor)
+    -   Measures whether all 4 chains converged to the same distribution
+    -   Rhat \< 1.01 means chains are well-mixed - we're good
+    -   Rhat \> 1.01 is a red flag: the sampler hasn't converged
+2.  n_eff (effective sample size)
+    -   MCMC draws are autocorrelated, so we don't get 4000 truly independent samples
+    -   n_eff tells us the effective count
+    -   n_eff \> 400 is our threshold (10% of 4000 draws)
+    -   Low n_eff suggests high autocorrelation; consider more iterations. We also print a per-parameter summary for alpha and all betas so we can inspect posterior means, SDs, and credible intervals.
+
+```{r}
+check_diagnostics <- function(fit, label) {
+  cat("\n──", label, "diagnostics ──\n")
+  s <- summary(fit)$summary
+
+  # Extract worst-case convergence stats across all parameters
+  rhat_max <- max(s[, "Rhat"],  na.rm = TRUE)
+  neff_min <- min(s[, "n_eff"], na.rm = TRUE)
+
+  cat("Max Rhat: ",  round(rhat_max, 4), " (should be < 1.01)\n")
+  cat("Min n_eff:", round(neff_min, 0),  " (should be > 400)\n")
+
+  # Warn if convergence thresholds are violated
+  if (rhat_max > 1.01) warning("Rhat > 1.01 — chains have not converged")
+  if (neff_min < 400)  warning("Low n_eff — consider more iterations")
+
+  # Per-parameter posterior summary for alpha and all beta coefficients
+  param_rows <- grep("^alpha$|^beta\\[", rownames(s))
+  cat("\nParameter summary:\n")
+  print(round(s[param_rows, c("mean", "sd", "2.5%", "97.5%", "Rhat", "n_eff")], 4))
+}
+
+# Run diagnostics on both models
+check_diagnostics(fit_primary,     "Primary Normal(0, 2.5)")
+check_diagnostics(fit_sensitivity, "Sensitivity Normal(0, 1.0)")
+```
+
+## -----------------------------------------------------
+
+## Extract Posterior Predictive Summaries
+
+After sampling, we summarize the posterior predictive distribution for each test observation. Instead of keeping all 4000 raw draws (which would be a huge matrix), we collapse them into per-observation summary statistics: mean, median, and 95% credible interval.
+
+### Output columns per observation:
+
+-   obs — observation index (1 to N_test)
+-   y_true — actual label from the test set (0 or 1)
+-   p_mean — posterior mean predicted default probability
+-   p_med — posterior median predicted default probability
+-   p_lower — 2.5th percentile of the posterior (lower CI bound)
+-   p_upper — 97.5th percentile of the posterior (upper CI bound)
+-   ci_width — width of the 95% credible interval (p_upper - p_lower) wider = more uncertainty about that prediction
+-   model — label identifying which prior run produced this row
+
+```{r}
+extract_predictions <- function(fit, label) {
+  # Extract the full posterior draw matrix: [4000 draws x N_test observations]
+  p_draws <- rstan::extract(fit, "p_test")$p_test
+
+  # Collapse draws into per-observation summaries — we discard the full
+  # draw matrix after this to keep memory usage manageable
+  p_mean  <- apply(p_draws, 2, mean)
+  p_lower <- apply(p_draws, 2, quantile, 0.025)
+  p_upper <- apply(p_draws, 2, quantile, 0.975)
+  p_med   <- apply(p_draws, 2, median)
+
+  df <- data.frame(
+    obs      = seq_len(N_test),
+    y_true   = y_test,
+    p_mean   = p_mean,
+    p_lower  = p_lower,
+    p_upper  = p_upper,
+    p_med    = p_med,
+    ci_width = p_upper - p_lower,   # wider CI = more uncertain prediction
+    model    = label
+  )
+  return(df)
+}
+
+# Extract summaries for both model runs
+pred_primary     <- extract_predictions(fit_primary,     "Bayesian_primary")
+pred_sensitivity <- extract_predictions(fit_sensitivity, "Bayesian_sensitivity")
+```
+
+## -----------------------------------------------------
+
+## LOO-CV: Leave-One-Out Cross-Validation
+
+LOO-CV gives us an estimate of out-of-sample predictive accuracy without actually re-fitting the model N times. It uses the posterior draws we already have to approximate how well the model would predict each observation if it had been left out of training.
+
+**IMPORTANT implementation note:** The naive approach - extract_log_lik() then pass to loo() - forces R to materialize the full 4000 x 24000 log-likelihood matrix (\~768MB) before computing LOO. This caused RStudio to crash from memory exhaustion (holding both the stanfit object AND the extracted matrix at once).
+
+Fix: pass the stanfit object directly to loo() with pars = "log_lik". This lets the loo package stream through draws without duplicating the full matrix in memory. cores = 4 parallelizes the PSIS computation. If this still crashes on your machine:
+
+-   Option A: reduce to cores = 1 (slower but lower peak memory)
+-   Option B: thin the draws before extraction:
+    -   log_lik \<- extract_log_lik(fit, merge_chains = TRUE)
+    -   log_lik \<- log_lik[seq(1, nrow(log_lik), by = 4), ] \# \~1000 draws
+
+```{r}
+loo_primary     <- loo(fit_primary,     pars = "log_lik", cores = 4)
+loo_sensitivity <- loo(fit_sensitivity, pars = "log_lik", cores = 4)
+
+# Print individual LOO summaries and head-to-head comparison
+cat("\nLOO primary:\n");     print(loo_primary)
+cat("\nLOO sensitivity:\n"); print(loo_sensitivity)
+cat("\nLOO comparison:\n");  print(loo_compare(loo_primary, loo_sensitivity))
+```
+
+## -----------------------------------------------------
+
+## Export Results to CSV
+
+We export three files for use in the Python/Jupyter side of the project (performance metrics, visualizations, and the 3-way coefficient comparison table):
+
+-   
+
+    1.  bayesian_predictions_primary.csv - Per-observation posterior predictive summaries, primary model
+
+-   
+
+    2.  bayesian_predictions_sensitivity.csv - Same structure, sensitivity model
+
+-   
+
+    3.  bayesian_coef_summary.csv - Posterior means, SDs, and 95% CIs for alpha and all betas, stacked for both models. Used for the coefficient comparison table alongside the classical logistic regression results.
+
+```{r}
+# Export prediction summaries
+write.csv(pred_primary,
+          "bayesian_predictions_primary.csv",     row.names = FALSE)
+write.csv(pred_sensitivity,
+          "bayesian_predictions_sensitivity.csv", row.names = FALSE)
+
+# Build posterior coefficient summary for both models
+beta_summary <- function(fit, label) {
+  s         <- summary(fit)$summary
+  beta_rows <- grep("^beta\\[|^alpha", rownames(s))
+  df        <- as.data.frame(round(s[beta_rows,
+                  c("mean", "sd", "2.5%", "97.5%", "Rhat", "n_eff")], 4))
+  df$parameter <- c("alpha", feature_cols)   # readable parameter names
+  df$model     <- label                      # tag which model run this came from
+  return(df)
+}
+
+coef_primary     <- beta_summary(fit_primary,     "primary_2.5")
+coef_sensitivity <- beta_summary(fit_sensitivity, "sensitivity_1.0")
+coef_all         <- rbind(coef_primary, coef_sensitivity)
+
+write.csv(coef_all, "bayesian_coef_summary.csv", row.names = FALSE)
+
+cat("\n── Export complete ──\n")
+```
